@@ -24,7 +24,12 @@ from redis.asyncio.connection import (
 )
 from redis.asyncio.retry import Retry
 from redis.backoff import NoBackoff
-from redis.exceptions import ConnectionError, InvalidResponse, TimeoutError
+from redis.exceptions import (
+    ConnectionError,
+    InvalidResponse,
+    ResponseError,
+    TimeoutError,
+)
 from redis.utils import HIREDIS_AVAILABLE
 from tests.conftest import skip_if_server_version_lt
 
@@ -644,6 +649,216 @@ async def test_connection_parse_response_resume(r: redis.Redis):
     assert response
     assert i > 0
     await conn.disconnect()
+
+
+class FakeWriter:
+    """A minimal StreamWriter stand-in for connection teardown."""
+
+    def __init__(self, stream=None):
+        self.stream = stream
+        self.transport = mock.Mock(**{"is_closing.return_value": False})
+        self.closed = False
+
+    def writelines(self, data):
+        if self.stream is not None:
+            self.stream.arm()
+
+    async def drain(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+    async def wait_closed(self):
+        pass
+
+
+class ScriptedStream(MockStream):
+    """
+    A MockStream that, like a real server, only serves its scripted response
+    after a command was written, and exposes the StreamReader attributes the
+    parser's can_read() consults.
+    """
+
+    def __init__(self, response, **kwargs):
+        super().__init__(b"", **kwargs)
+        self._response = response
+        self._buffer = bytearray()
+
+    def arm(self):
+        self.data = self._response
+        self.pos = 0
+
+    def at_eof(self):
+        return False
+
+
+def make_fake_connection(data, parser_class, protocol):
+    """Build a Connection whose parser reads from a scripted fake stream."""
+    conn = Connection(parser_class=parser_class, protocol=protocol)
+    conn._reader = MockStream(data)
+    conn._writer = FakeWriter()
+    conn._parser.on_connect(conn)
+    return conn
+
+
+@pytest.mark.onlynoncluster
+@pytest.mark.parametrize(
+    "parser_class,protocol",
+    [(_AsyncRESP2Parser, 2), (_AsyncRESP3Parser, 3)],
+    ids=["RESP2", "RESP3"],
+)
+class TestUnrecoverableParseError:
+    """
+    A RESP framing/protocol error leaves the parser unable to find the next
+    reply boundary, so the connection must be invalidated even when the
+    caller asked not to disconnect on error - otherwise every subsequent
+    read would re-parse the same bad frame and no later reply could arrive.
+    """
+
+    async def test_invalid_frame_disconnects_despite_disconnect_on_error_false(
+        self, parser_class, protocol
+    ):
+        conn = make_fake_connection(b"xgarbage\r\n", parser_class, protocol)
+
+        with pytest.raises(InvalidResponse, match="Protocol Error"):
+            await conn.read_response(disconnect_on_error=False)
+
+        # the connection is torn down and the parse buffer released
+        assert conn._reader is None
+        assert conn._writer is None
+        assert conn._parser._buffer == b""
+        assert conn._parser._chunks == []
+
+    async def test_second_read_does_not_reconsume_bad_frame(
+        self, parser_class, protocol
+    ):
+        conn = make_fake_connection(b"xgarbage\r\n", parser_class, protocol)
+        with pytest.raises(InvalidResponse, match="Protocol Error"):
+            await conn.read_response(disconnect_on_error=False)
+
+        # the bad frame is gone with the connection: a second read fails as
+        # a closed connection instead of re-parsing the same bad bytes
+        with pytest.raises(ConnectionError, match="Connection closed"):
+            await conn.read_response(disconnect_on_error=False)
+
+    async def test_invalid_nested_frame_disconnects(self, parser_class, protocol):
+        # the first array element parses fine; the second is not a valid
+        # RESP type byte, so the frame boundaries are unrecoverable
+        conn = make_fake_connection(b"*2\r\n+OK\r\nxbad\r\n", parser_class, protocol)
+
+        with pytest.raises(InvalidResponse, match="Protocol Error"):
+            await conn.read_response(disconnect_on_error=False)
+
+        assert conn._reader is None
+
+    async def test_malformed_frame_length_disconnects(self, parser_class, protocol):
+        conn = make_fake_connection(b"$abc\r\n", parser_class, protocol)
+
+        with pytest.raises(InvalidResponse, match="Protocol Error"):
+            await conn.read_response(disconnect_on_error=False)
+
+        assert conn._reader is None
+
+    async def test_response_error_keeps_connection_reusable(
+        self, parser_class, protocol
+    ):
+        conn = make_fake_connection(
+            b"-ERR unknown command\r\n+OK\r\n", parser_class, protocol
+        )
+
+        with pytest.raises(ResponseError, match="unknown command"):
+            await conn.read_response(disconnect_on_error=False)
+
+        # an application-level error is fully recoverable: the connection
+        # stays up and the next valid reply is still readable
+        assert conn._reader is not None
+        assert await conn.read_response(disconnect_on_error=False) == b"OK"
+
+    async def test_pool_recovers_after_unrecoverable_parse_error(
+        self, parser_class, protocol
+    ):
+        streams = iter([ScriptedStream(b"xbad\r\n"), ScriptedStream(b"+OK\r\n")])
+
+        class FakeConnection(Connection):
+            async def _connect(self):
+                self._reader = next(streams)
+                self._writer = FakeWriter(self._reader)
+
+        pool = ConnectionPool(
+            connection_class=FakeConnection,
+            parser_class=parser_class,
+            protocol=protocol,
+            redis_connect_func=lambda conn: conn._parser.on_connect(conn),
+        )
+        try:
+            conn = await pool.get_connection()
+            await conn.send_command("PING")
+            with pytest.raises(InvalidResponse, match="Protocol Error"):
+                await conn.read_response(disconnect_on_error=False)
+            await pool.release(conn)
+
+            # the normal pool path re-establishes the dead connection on a
+            # fresh stream; no manual cleanup of private state is needed
+            conn = await pool.get_connection()
+            await conn.send_command("PING")
+            assert await conn.read_response() == b"OK"
+        finally:
+            await pool.disconnect()
+
+
+@pytest.mark.onlynoncluster
+class TestUnrecoverableParseErrorPushPath:
+    """The push/maintenance-notification read path (RESP3) must also
+    invalidate the connection on unrecoverable framing errors."""
+
+    async def test_push_read_disconnects_on_invalid_frame_after_push(self):
+        conn = make_fake_connection(
+            b">3\r\n$7\r\nmessage\r\n$8\r\nchannel1\r\n$2\r\nhi\r\nxbad\r\n",
+            _AsyncRESP3Parser,
+            3,
+        )
+        pushes = []
+
+        async def handler(response):
+            pushes.append(response)
+
+        conn._parser.set_pubsub_push_handler(handler)
+
+        with pytest.raises(InvalidResponse, match="Protocol Error"):
+            await conn.read_response(disconnect_on_error=False)
+
+        # the valid push message was delivered before the bad frame
+        assert pushes == [[b"message", b"channel1", b"hi"]]
+        assert conn._reader is None
+
+    async def test_push_request_read_disconnects_on_invalid_frame(self):
+        conn = make_fake_connection(b"xbad\r\n", _AsyncRESP3Parser, 3)
+
+        with pytest.raises(InvalidResponse, match="Protocol Error"):
+            await conn.read_response(disconnect_on_error=False, push_request=True)
+
+        assert conn._reader is None
+
+    async def test_maintenance_push_read_disconnects_on_invalid_frame(self):
+        conn = make_fake_connection(
+            b">4\r\n$6\r\nMOVING\r\n:1\r\n:10\r\n$14\r\n127.0.0.1:6379\r\nxbad\r\n",
+            _AsyncRESP3Parser,
+            3,
+        )
+        notifications = []
+
+        async def handler(notification):
+            notifications.append(notification)
+
+        conn._parser.set_node_moving_push_handler(handler)
+
+        with pytest.raises(InvalidResponse, match="Protocol Error"):
+            await conn.read_response(disconnect_on_error=False)
+
+        # the valid maintenance notification was delivered before the bad frame
+        assert len(notifications) == 1
+        assert conn._reader is None
 
 
 @pytest.mark.onlynoncluster

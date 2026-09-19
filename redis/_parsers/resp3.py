@@ -9,6 +9,7 @@ from .base import (
     PushNotificationsParser,
     _AsyncRESPBase,
     _RESPBase,
+    _parse_frame_number,
 )
 from .socket import SERVER_CLOSED_CONNECTION_ERROR
 
@@ -35,7 +36,9 @@ class _RESP3Parser(_RESPBase, PushNotificationsParser):
         push_request=False,
         timeout: Union[float, object] = SENTINEL,
     ):
-        pos = self._buffer.get_pos() if self._buffer is not None else None
+        if self._buffer is None:
+            raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
+        pos = self._buffer.get_pos()
         try:
             result = self._read_response(
                 disable_decoding=disable_decoding,
@@ -71,7 +74,9 @@ class _RESP3Parser(_RESPBase, PushNotificationsParser):
         # server returned an error
         if byte in (b"-", b"!"):
             if byte == b"!":
-                response = self._buffer.read(int(response), timeout=timeout)
+                response = self._buffer.read(
+                    _parse_frame_number(response, raw), timeout=timeout
+                )
             response = response.decode("utf-8", errors="replace")
             error = self.parse_error(response)
             # if the error is a ConnectionError, raise immediately so the user
@@ -91,24 +96,28 @@ class _RESP3Parser(_RESPBase, PushNotificationsParser):
             return None
         # int and big int values
         elif byte in (b":", b"("):
-            return int(response)
+            return _parse_frame_number(response, raw)
         # double value
         elif byte == b",":
-            return float(response)
+            return _parse_frame_number(response, raw, float)
         # bool value
         elif byte == b"#":
             return response == b"t"
         # bulk response
         elif byte == b"$":
-            response = self._buffer.read(int(response), timeout=timeout)
+            response = self._buffer.read(
+                _parse_frame_number(response, raw), timeout=timeout
+            )
         # verbatim string response
         elif byte == b"=":
-            response = self._buffer.read(int(response), timeout=timeout)[4:]
+            response = self._buffer.read(
+                _parse_frame_number(response, raw), timeout=timeout
+            )[4:]
         # array response
         elif byte == b"*":
             response = [
                 self._read_response(disable_decoding=disable_decoding, timeout=timeout)
-                for _ in range(int(response))
+                for _ in range(_parse_frame_number(response, raw))
             ]
         # set response
         elif byte == b"~":
@@ -116,7 +125,7 @@ class _RESP3Parser(_RESPBase, PushNotificationsParser):
             # so we return sets as list, all the time, for predictability
             response = [
                 self._read_response(disable_decoding=disable_decoding, timeout=timeout)
-                for _ in range(int(response))
+                for _ in range(_parse_frame_number(response, raw))
             ]
         # map response
         elif byte == b"%":
@@ -124,7 +133,7 @@ class _RESP3Parser(_RESPBase, PushNotificationsParser):
             # Evaluation order of key:val expression in dict comprehension only
             # became defined to be left-right in version 3.8
             resp_dict = {}
-            for _ in range(int(response)):
+            for _ in range(_parse_frame_number(response, raw)):
                 key = self._read_response(
                     disable_decoding=disable_decoding, timeout=timeout
                 )
@@ -142,7 +151,7 @@ class _RESP3Parser(_RESPBase, PushNotificationsParser):
                     push_request=push_request,
                     timeout=timeout,
                 )
-                for _ in range(int(response))
+                for _ in range(_parse_frame_number(response, raw))
             ]
             response = self.handle_push_response(response)
 
@@ -190,9 +199,15 @@ class _AsyncRESP3Parser(_AsyncRESPBase, AsyncPushNotificationsParser):
             self._buffer += b"".join(self._chunks)
             self._chunks.clear()
         self._pos = 0
-        response = await self._read_response(
-            disable_decoding=disable_decoding, push_request=push_request
-        )
+        try:
+            response = await self._read_response(
+                disable_decoding=disable_decoding, push_request=push_request
+            )
+        except InvalidResponse:
+            # A framing error means the buffered bytes can never be parsed:
+            # drop them so the bad frame is not re-parsed on the next read.
+            self._clear()
+            raise
         # Successfully parsing a response allows us to clear our parsing buffer
         self._clear()
         return response
@@ -212,7 +227,7 @@ class _AsyncRESP3Parser(_AsyncRESPBase, AsyncPushNotificationsParser):
         # server returned an error
         if byte in (b"-", b"!"):
             if byte == b"!":
-                response = await self._read(int(response))
+                response = await self._read(_parse_frame_number(response, raw))
             response = response.decode("utf-8", errors="replace")
             error = self.parse_error(response)
             # if the error is a ConnectionError, raise immediately so the user
@@ -233,24 +248,24 @@ class _AsyncRESP3Parser(_AsyncRESPBase, AsyncPushNotificationsParser):
             return None
         # int and big int values
         elif byte in (b":", b"("):
-            return int(response)
+            return _parse_frame_number(response, raw)
         # double value
         elif byte == b",":
-            return float(response)
+            return _parse_frame_number(response, raw, float)
         # bool value
         elif byte == b"#":
             return response == b"t"
         # bulk response
         elif byte == b"$":
-            response = await self._read(int(response))
+            response = await self._read(_parse_frame_number(response, raw))
         # verbatim string response
         elif byte == b"=":
-            response = (await self._read(int(response)))[4:]
+            response = (await self._read(_parse_frame_number(response, raw)))[4:]
         # array response
         elif byte == b"*":
             response = [
                 (await self._read_response(disable_decoding=disable_decoding))
-                for _ in range(int(response))
+                for _ in range(_parse_frame_number(response, raw))
             ]
         # set response
         elif byte == b"~":
@@ -258,7 +273,7 @@ class _AsyncRESP3Parser(_AsyncRESPBase, AsyncPushNotificationsParser):
             # so we always convert to a list, to have predictable return types
             response = [
                 (await self._read_response(disable_decoding=disable_decoding))
-                for _ in range(int(response))
+                for _ in range(_parse_frame_number(response, raw))
             ]
         # map response
         elif byte == b"%":
@@ -266,7 +281,7 @@ class _AsyncRESP3Parser(_AsyncRESPBase, AsyncPushNotificationsParser):
             # Evaluation order of key:val expression in dict comprehension only
             # became defined to be left-right in version 3.8
             resp_dict = {}
-            for _ in range(int(response)):
+            for _ in range(_parse_frame_number(response, raw)):
                 key = await self._read_response(disable_decoding=disable_decoding)
                 resp_dict[key] = await self._read_response(
                     disable_decoding=disable_decoding, push_request=push_request
@@ -280,7 +295,7 @@ class _AsyncRESP3Parser(_AsyncRESPBase, AsyncPushNotificationsParser):
                         disable_decoding=disable_decoding, push_request=push_request
                     )
                 )
-                for _ in range(int(response))
+                for _ in range(_parse_frame_number(response, raw))
             ]
             response = await self.handle_push_response(response)
             if not push_request:

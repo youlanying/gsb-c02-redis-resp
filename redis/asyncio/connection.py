@@ -82,6 +82,7 @@ from redis.exceptions import (
     AuthenticationWrongNumberOfArgsError,
     ConnectionError,
     DataError,
+    InvalidResponse,
     MaxConnectionsError,
     RedisError,
     ResponseError,
@@ -1418,6 +1419,15 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
                 add_debug_log_for_connection_failure(self, e, "reading response")
                 await self.disconnect(nowait=True)
             raise ConnectionError(f"Error while reading from {host_error} : {e.args}")
+        except InvalidResponse as e:
+            # A RESP protocol/framing error means the parser can no longer
+            # tell where the next reply starts, so this connection can never
+            # be reused. Drop it even when the caller asked not to disconnect
+            # on error - otherwise the same bad frame would be re-parsed on
+            # every read and no later reply could ever arrive.
+            add_debug_log_for_connection_failure(self, e, "reading response")
+            await self.disconnect(nowait=True)
+            raise
         except BaseException as e:
             # Also by default close in case of BaseException.  A lot of code
             # relies on this behaviour when doing Command/Response pairs.

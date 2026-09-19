@@ -25,6 +25,7 @@ from ..exceptions import (
     ConnectionError,
     ExecAbortError,
     ExternalAuthProviderError,
+    InvalidResponse,
     MasterDownError,
     ModuleError,
     MovedError,
@@ -70,6 +71,20 @@ NO_SUCH_FIELDSET_ERROR = {
 }
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_frame_number(value: bytes, raw: bytes, number_type=int):
+    """
+    Parse a numeric RESP frame field (a length, count, or number reply).
+
+    Malformed data here is a framing error, not an application error: the
+    parser can no longer trust the reply boundaries, so report it the same
+    way an unknown type byte is reported (and the way hiredis reports it).
+    """
+    try:
+        return number_type(value)
+    except ValueError:
+        raise InvalidResponse(f"Protocol Error: {raw!r}") from None
 
 
 class BaseParser(ABC):

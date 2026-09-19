@@ -3,7 +3,7 @@ from typing import Any, Union
 from ..exceptions import ConnectionError, InvalidResponse, ResponseError
 from ..typing import EncodableT
 from ..utils import SENTINEL
-from .base import _AsyncRESPBase, _RESPBase
+from .base import _AsyncRESPBase, _RESPBase, _parse_frame_number
 from .socket import SERVER_CLOSED_CONNECTION_ERROR
 
 
@@ -13,7 +13,9 @@ class _RESP2Parser(_RESPBase):
     def read_response(
         self, disable_decoding=False, timeout: Union[float, object] = SENTINEL
     ):
-        pos = self._buffer.get_pos() if self._buffer else None
+        if self._buffer is None:
+            raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
+        pos = self._buffer.get_pos()
         try:
             result = self._read_response(
                 disable_decoding=disable_decoding, timeout=timeout
@@ -53,19 +55,21 @@ class _RESP2Parser(_RESPBase):
             pass
         # int value
         elif byte == b":":
-            return int(response)
+            return _parse_frame_number(response, raw)
         # bulk response
         elif byte == b"$" and response == b"-1":
             return None
         elif byte == b"$":
-            response = self._buffer.read(int(response), timeout=timeout)
+            response = self._buffer.read(
+                _parse_frame_number(response, raw), timeout=timeout
+            )
         # multi-bulk response
         elif byte == b"*" and response == b"-1":
             return None
         elif byte == b"*":
             response = [
                 self._read_response(disable_decoding=disable_decoding, timeout=timeout)
-                for i in range(int(response))
+                for i in range(_parse_frame_number(response, raw))
             ]
         else:
             raise InvalidResponse(f"Protocol Error: {raw!r}")
@@ -86,7 +90,13 @@ class _AsyncRESP2Parser(_AsyncRESPBase):
             self._buffer += b"".join(self._chunks)
             self._chunks.clear()
         self._pos = 0
-        response = await self._read_response(disable_decoding=disable_decoding)
+        try:
+            response = await self._read_response(disable_decoding=disable_decoding)
+        except InvalidResponse:
+            # A framing error means the buffered bytes can never be parsed:
+            # drop them so the bad frame is not re-parsed on the next read.
+            self._clear()
+            raise
         # Successfully parsing a response allows us to clear our parsing buffer
         self._clear()
         return response
@@ -117,19 +127,19 @@ class _AsyncRESP2Parser(_AsyncRESPBase):
             pass
         # int value
         elif byte == b":":
-            return int(response)
+            return _parse_frame_number(response, raw)
         # bulk response
         elif byte == b"$" and response == b"-1":
             return None
         elif byte == b"$":
-            response = await self._read(int(response))
+            response = await self._read(_parse_frame_number(response, raw))
         # multi-bulk response
         elif byte == b"*" and response == b"-1":
             return None
         elif byte == b"*":
             response = [
                 (await self._read_response(disable_decoding))
-                for _ in range(int(response))  # noqa
+                for _ in range(_parse_frame_number(response, raw))  # noqa
             ]
         else:
             raise InvalidResponse(f"Protocol Error: {raw!r}")
