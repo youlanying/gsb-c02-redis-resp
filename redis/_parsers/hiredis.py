@@ -250,17 +250,24 @@ class _HiredisParser(BaseParser, PushNotificationsParser):
         if reader is None:
             raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
 
-        if disable_decoding:
-            response = reader.gets(False)
-        else:
-            response = reader.gets()
-
-        while response is NOT_ENOUGH_DATA:
-            self.read_from_socket(timeout=timeout)
+        try:
             if disable_decoding:
                 response = reader.gets(False)
             else:
                 response = reader.gets()
+
+            while response is NOT_ENOUGH_DATA:
+                self.read_from_socket(timeout=timeout)
+                if disable_decoding:
+                    response = reader.gets(False)
+                else:
+                    response = reader.gets()
+        except InvalidResponse:
+            # The hiredis reader cannot resynchronize after a protocol error,
+            # so drop it: this connection must never be reused, or the same
+            # bad frame would be re-parsed by every subsequent read.
+            self._reader = None
+            raise
         # if the response is a ConnectionError or the response is a list and
         # the first item is a ConnectionError, raise it as something bad
         # happened
@@ -377,17 +384,25 @@ class _AsyncHiredisParser(AsyncBaseParser, AsyncPushNotificationsParser):
         if not self._connected:
             raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR) from None
 
-        if disable_decoding:
-            response = self._reader.gets(False)
-        else:
-            response = self._reader.gets()
-
-        while response is NOT_ENOUGH_DATA:
-            await self.read_from_socket()
+        try:
             if disable_decoding:
                 response = self._reader.gets(False)
             else:
                 response = self._reader.gets()
+
+            while response is NOT_ENOUGH_DATA:
+                await self.read_from_socket()
+                if disable_decoding:
+                    response = self._reader.gets(False)
+                else:
+                    response = self._reader.gets()
+        except InvalidResponse:
+            # The hiredis reader cannot resynchronize after a protocol error,
+            # so drop it and invalidate the connection: the same bad frame
+            # must never be re-parsed by a subsequent read.
+            self._reader = None
+            self._connected = False
+            raise
 
         # if the response is a ConnectionError or the response is a list and
         # the first item is a ConnectionError, raise it as something bad

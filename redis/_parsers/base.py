@@ -25,6 +25,7 @@ from ..exceptions import (
     ConnectionError,
     ExecAbortError,
     ExternalAuthProviderError,
+    InvalidResponse,
     MasterDownError,
     ModuleError,
     MovedError,
@@ -70,6 +71,27 @@ NO_SUCH_FIELDSET_ERROR = {
 }
 
 logger = logging.getLogger(__name__)
+
+
+def parse_frame_int(raw: bytes) -> int:
+    """Parse an integer carried by a RESP frame header/element.
+
+    A non-numeric value means the stream is no longer aligned on RESP frame
+    boundaries, so the failure is a protocol error rather than an ordinary
+    ValueError that a caller might consider retryable.
+    """
+    try:
+        return int(raw)
+    except (TypeError, ValueError) as error:
+        raise InvalidResponse(f"Protocol Error: invalid integer {raw!r}") from error
+
+
+def parse_frame_float(raw: bytes) -> float:
+    """Parse a float carried by a RESP frame header/element."""
+    try:
+        return float(raw)
+    except (TypeError, ValueError) as error:
+        raise InvalidResponse(f"Protocol Error: invalid float {raw!r}") from error
 
 
 class BaseParser(ABC):

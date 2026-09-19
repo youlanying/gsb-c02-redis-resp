@@ -15,6 +15,7 @@ class MockSocket:
         self.counter = 0
         self.pos = 0
         self.interrupt_every = interrupt_every
+        self.closed = False
 
     def tick(self):
         self.counter += 1
@@ -39,3 +40,12 @@ class MockSocket:
         self.pos += len(result)
         buffer[: len(result)] = result
         return len(result)
+
+    def settimeout(self, timeout):
+        pass
+
+    def shutdown(self, how):
+        pass
+
+    def close(self):
+        self.closed = True

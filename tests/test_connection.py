@@ -47,7 +47,13 @@ from redis.credentials import UsernamePasswordCredentialProvider
 from redis.event import (
     EventDispatcher,
 )
-from redis.exceptions import ConnectionError, InvalidResponse, RedisError, TimeoutError
+from redis.exceptions import (
+    ConnectionError,
+    InvalidResponse,
+    RedisError,
+    ResponseError,
+    TimeoutError,
+)
 from redis.observability.attributes import (
     DB_CLIENT_CONNECTION_POOL_NAME,
     DB_CLIENT_CONNECTION_STATE,
@@ -953,6 +959,152 @@ def test_connection_parse_response_resume(r: redis.Redis, parser_class):
         pytest.fail("didn't receive a response")
     assert response
     assert i > 0
+
+
+def make_fake_connection(data, protocol=2):
+    """
+    A Connection whose socket serves the scripted data bytes, so protocol
+    parsing can be exercised deterministically without a real Redis server.
+    """
+    parser_class = _RESP2Parser if protocol == 2 else _RESP3Parser
+    conn = Connection(protocol=protocol, parser_class=parser_class)
+    conn._sock = MockSocket(data)
+    conn._parser.on_connect(conn)
+    return conn
+
+
+@pytest.mark.fixed_client
+@pytest.mark.parametrize("protocol", [2, 3])
+@pytest.mark.parametrize(
+    "data",
+    [b"*2\r\n+OK\r\n?bogus\r\n", b"$abc\r\n"],
+    ids=["invalid-nested-type-byte", "invalid-bulk-length"],
+)
+def test_protocol_error_invalidates_connection_with_disconnect_on_error_false(
+    protocol, data
+):
+    """
+    An unrecoverable framing error (an invalid type byte nested inside an
+    array reply, or a non-numeric bulk length) must invalidate the connection
+    even when the caller asked not to disconnect on error - otherwise the
+    same bad frame would be re-parsed by every subsequent read.
+    """
+    conn = make_fake_connection(data, protocol=protocol)
+
+    with pytest.raises(InvalidResponse):
+        conn.read_response(disconnect_on_error=False)
+
+    # the connection is invalidated: socket closed, parser state released
+    assert conn._sock is None
+    assert conn._parser._buffer is None
+
+    # a second read on the same broken connection must not consume the same
+    # bad frame again
+    with pytest.raises(ConnectionError):
+        conn.read_response(disconnect_on_error=False)
+
+
+@pytest.mark.fixed_client
+def test_protocol_error_on_push_read_invalidates_connection():
+    """
+    The push/maintenance-notification read path (push_request=True,
+    disconnect_on_error=False) must also invalidate the connection on an
+    unrecoverable framing error inside a push message.
+    """
+    conn = make_fake_connection(b">2\r\n+message\r\n?bogus\r\n", protocol=3)
+
+    with pytest.raises(InvalidResponse):
+        conn.read_response(push_request=True, disconnect_on_error=False)
+
+    assert conn._sock is None
+    assert conn._parser._buffer is None
+
+    with pytest.raises(ConnectionError):
+        conn.read_response(push_request=True, disconnect_on_error=False)
+
+
+@pytest.mark.fixed_client
+@pytest.mark.parametrize("protocol", [2, 3])
+def test_response_error_keeps_connection_reusable(protocol):
+    """
+    An application-level ResponseError is not a framing error: the connection
+    must stay usable and the replies queued behind it must still arrive.
+    """
+    conn = make_fake_connection(
+        b"-ERR unknown command\r\n+OK\r\n", protocol=protocol
+    )
+
+    with pytest.raises(ResponseError, match="unknown command"):
+        conn.read_response(disconnect_on_error=False)
+
+    assert conn._sock is not None
+    assert conn.read_response(disconnect_on_error=False) == b"OK"
+
+
+@pytest.mark.fixed_client
+def test_pool_reconnects_after_protocol_error():
+    """
+    After a protocol error invalidates a connection, the pool's normal
+    reconnect path must establish a fresh connection and keep serving
+    requests, without the caller cleaning up private state.
+    """
+
+    class QueuedReplySocket:
+        """Fake socket that serves its scripted reply only after a command
+        is sent, so the pool's dirty-connection check sees a clean socket."""
+
+        def __init__(self, reply):
+            self.reply = reply
+            self.data = b""
+            self.pos = 0
+            self.closed = False
+
+        def sendall(self, data):
+            self.data += self.reply
+
+        def recv(self, bufsize):
+            if self.pos >= len(self.data):
+                raise socket.timeout()
+            chunk = self.data[self.pos : self.pos + bufsize]
+            self.pos += len(chunk)
+            return chunk
+
+        def settimeout(self, timeout):
+            pass
+
+        def shutdown(self, how):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    class FakeConnection(Connection):
+        sockets = []
+
+        def _connect(self):
+            return self.sockets.pop(0)
+
+        def on_connect_check_health(self, check_health=True):
+            self._parser.on_connect(self)
+
+    FakeConnection.sockets = [
+        QueuedReplySocket(b"?bogus\r\n"),
+        QueuedReplySocket(b"+OK\r\n"),
+    ]
+    pool = ConnectionPool(connection_class=FakeConnection, protocol=2)
+    try:
+        conn = pool.get_connection()
+        conn.send_command("PING")
+        with pytest.raises(InvalidResponse):
+            conn.read_response(disconnect_on_error=False)
+        pool.release(conn)
+
+        conn = pool.get_connection()
+        conn.send_command("PING")
+        assert conn.read_response() == b"OK"
+        pool.release(conn)
+    finally:
+        pool.disconnect()
 
 
 @pytest.mark.fixed_client
